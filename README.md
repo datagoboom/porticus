@@ -1,6 +1,6 @@
 # Porticus
 
-Serial <-> WebSocket Bridge. Connects serial devices to WebSocket clients.
+Serial <-> WebSocket Bridge. Connects serial devices to WebSocket clients. Each byte is handled as an event without respect to content.
 
 ## Install
 
