@@ -24,7 +24,7 @@ All options:
 -b, --baud <BAUD>                     Baud rate [default: 9600]
 -w, --websocket-port <PORT>           WebSocket port [default: 8080]
     --websocket-host <HOST>           WebSocket host [default: 127.0.0.1] 
-    --broadcast-capacity <CAP>         Broadcast channel capacity [default: 16]
+    --broadcast-capacity <CAP>        Broadcast channel capacity [default: 16]
     --kill                            Kill running instance
     --debug                           Enable debug logging
 -q, --quiet                           Silence all output
