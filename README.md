@@ -1,6 +1,10 @@
 # Porticus
 
-Serial <-> WebSocket Bridge. Connects serial devices to WebSocket clients. Each byte is handled as an event without respect to content.
+Serial <-> WebSocket Bridge. Connects serial devices to WebSocket clients. 
+
+Some notes:
+- TX is delivered as a single message, RX returns one byte per websocket event
+- Process PID is stored in ~/.config/porticus/porticus.pid on *nix systems
 
 ## Install
 
