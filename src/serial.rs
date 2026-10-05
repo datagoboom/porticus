@@ -1,43 +1,69 @@
-use tokio::sync::Mutex;
-use std::sync::Arc;
-use tokio::sync::broadcast;
-use tokio_serial::SerialPortBuilderExt;
-use crate::config::PorticusConfig;
-use crate::error::PorticusError;
+use std::io;
+use std::time::Duration;
 
-pub async fn create_serial_port(
-    config: &PorticusConfig,
-) -> Result<Arc<Mutex<dyn tokio_serial::SerialPort>>, PorticusError> {
-    let serial_port = tokio_serial::new(&config.serial_port, config.baud_rate)
-        .open_native_async()?;
-    Ok(Arc::new(Mutex::new(serial_port)))
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{broadcast, mpsc};
+use tokio_serial::{SerialPortBuilderExt, SerialStream};
+use tracing::{info, warn};
+
+use crate::config::PorticusConfig;
+
+const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
+
+/// Owns the serial port for the lifetime of the process. Reads are fanned out
+/// to WebSocket clients through `tx`; writes from clients arrive on `write_rx`.
+/// If the device disappears, keeps retrying the open with exponential backoff
+/// so clients can stay connected across a replug.
+pub async fn run(
+    config: PorticusConfig,
+    tx: broadcast::Sender<Vec<u8>>,
+    mut write_rx: mpsc::Receiver<Vec<u8>>,
+) {
+    let mut delay = Duration::from_secs(1);
+    loop {
+        match tokio_serial::new(&config.serial_port, config.baud_rate).open_native_async() {
+            Ok(stream) => {
+                info!(port = %config.serial_port, baud = config.baud_rate, "serial port opened");
+                delay = Duration::from_secs(1);
+                match bridge(stream, &tx, &mut write_rx, config.buffer_size).await {
+                    Ok(()) => return, // all write senders dropped: shutting down
+                    Err(e) => warn!("serial port error: {e}"),
+                }
+            }
+            Err(e) => warn!(port = %config.serial_port, "failed to open serial port: {e}"),
+        }
+        info!("retrying in {}s", delay.as_secs());
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(MAX_RECONNECT_DELAY);
+    }
 }
 
-pub async fn handle_serial_reading(
-    serial_reader: Arc<Mutex<dyn tokio_serial::SerialPort>>,
-    tx: Arc<broadcast::Sender<Vec<u8>>>,
+/// Pumps one open serial stream: device bytes out through `tx` (one message
+/// per read, not per byte), client bytes in from `write_rx`. Returns Ok(())
+/// when the write channel closes, Err on device I/O failure.
+pub async fn bridge(
+    stream: SerialStream,
+    tx: &broadcast::Sender<Vec<u8>>,
+    write_rx: &mut mpsc::Receiver<Vec<u8>>,
     buffer_size: usize,
-    quiet: bool,
-) {
-    let mut buffer = vec![0u8; buffer_size];
-    
+) -> io::Result<()> {
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let mut buffer = vec![0u8; buffer_size.max(1)];
     loop {
-        match serial_reader.lock().await.read(&mut buffer) {
-            Ok(n) if n > 0 => {
-                for byte in &buffer[..n] {
-                    let _ = tx.send(vec![*byte]);
+        tokio::select! {
+            read = reader.read(&mut buffer) => {
+                let n = read?;
+                if n == 0 {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "serial port closed"));
                 }
+                // Ignore send errors: no clients connected is fine.
+                let _ = tx.send(buffer[..n].to_vec());
             }
-            Ok(_) => continue,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                continue;
-            }
-            Err(e) => {
-                if !quiet {
-                    eprintln!("Error reading from serial port: {}", e);
+            data = write_rx.recv() => {
+                match data {
+                    Some(data) => writer.write_all(&data).await?,
+                    None => return Ok(()),
                 }
-                break;
             }
         }
     }

@@ -8,4 +8,4 @@ pub enum PorticusError {
     WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-} 
+}

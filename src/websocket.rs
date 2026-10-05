@@ -1,94 +1,74 @@
-use futures::{SinkExt, StreamExt, Sink};
+use futures::{SinkExt, StreamExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, Mutex};
-use tokio_tungstenite::{
-    accept_async,
-    tungstenite::{Message, protocol::frame::Payload},
-};
-use std::sync::Arc;
-use std::fmt::Debug;
-use crate::config::PorticusConfig;
+use tokio::sync::{broadcast, mpsc};
+use tokio_tungstenite::{accept_async, tungstenite::Message, WebSocketStream};
+use tracing::{debug, info, warn};
+
 use crate::error::PorticusError;
 
-pub async fn run_websocket_server(
-    config: &PorticusConfig,
-    tx: Arc<broadcast::Sender<Vec<u8>>>,
-    serial_writer: Arc<Mutex<dyn tokio_serial::SerialPort>>,
-    quiet: bool,
+/// Accepts WebSocket clients forever. Each client runs in its own task, so a
+/// slow client or a failed handshake never affects the others.
+pub async fn run(
+    listener: TcpListener,
+    tx: broadcast::Sender<Vec<u8>>,
+    serial_tx: mpsc::Sender<Vec<u8>>,
 ) -> Result<(), PorticusError> {
-    let addr = format!("{}:{}", config.websocket_host, config.websocket_port);
-    let listener = TcpListener::bind(&addr).await?;
-
-    while let Ok((stream, addr)) = listener.accept().await {
-        if !quiet {
-            println!("New client connected: {}", addr);
-        }
-        
-        let ws_stream = accept_async(stream).await?;
-        let (ws_sender, ws_receiver) = ws_stream.split();
+    loop {
+        let (stream, addr) = listener.accept().await?;
         let rx = tx.subscribe();
-        let serial_writer = serial_writer.clone();
-
-        handle_client_connection(
-            ws_sender,
-            ws_receiver,
-            rx,
-            serial_writer,
-            quiet,
-        ).await;
+        let serial_tx = serial_tx.clone();
+        tokio::spawn(async move {
+            match accept_async(stream).await {
+                Ok(ws) => {
+                    info!(%addr, "client connected");
+                    handle_client(ws, rx, serial_tx).await;
+                    info!(%addr, "client disconnected");
+                }
+                Err(e) => warn!(%addr, "websocket handshake failed: {e}"),
+            }
+        });
     }
-    Ok(())
 }
 
-async fn handle_client_connection<S, R>(
-    mut ws_sender: S,
-    mut ws_receiver: R,
+async fn handle_client<S>(
+    ws: WebSocketStream<S>,
     mut rx: broadcast::Receiver<Vec<u8>>,
-    serial_writer: Arc<Mutex<dyn tokio_serial::SerialPort>>,
-    quiet: bool,
+    serial_tx: mpsc::Sender<Vec<u8>>,
 ) where
-    S: Sink<Message> + Unpin + Send + 'static,
-    S::Error: Debug,
-    R: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin + Send + 'static,
+    S: AsyncRead + AsyncWrite + Unpin,
 {
-    let write_handle = tokio::spawn(async move {
-        while let Some(msg) = ws_receiver.next().await {
-            match msg {
-                Ok(msg) => {
-                    if msg.is_binary() || msg.is_text() {
-                        let data = msg.into_data();
-                        if let Err(e) = serial_writer.lock().await.write_all(data.as_slice()) {
-                            if !quiet {
-                                eprintln!("Failed to write to serial port: {:?}", e);
-                            }
+    let (mut sender, mut receiver) = ws.split();
+    loop {
+        tokio::select! {
+            msg = receiver.next() => {
+                match msg {
+                    Some(Ok(msg)) if msg.is_binary() || msg.is_text() => {
+                        if serial_tx.send(msg.into_data().to_vec()).await.is_err() {
+                            break; // serial task gone
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(_)) => {} // ping/pong handled by tungstenite
+                    Some(Err(e)) => {
+                        debug!("websocket receive error: {e}");
+                        break;
+                    }
+                }
+            }
+            data = rx.recv() => {
+                match data {
+                    Ok(data) => {
+                        if sender.send(Message::Binary(data.into())).await.is_err() {
                             break;
                         }
                     }
-                }
-                Err(e) => {
-                    if !quiet {
-                        eprintln!("WebSocket receive error: {:?}", e);
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("client too slow, dropped {n} serial messages");
                     }
-                    break;
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
         }
-    });
-
-    let read_handle = tokio::spawn(async move {
-        while let Ok(data) = rx.recv().await {
-            let message = Message::Binary(Payload::Vec(data));
-            if let Err(e) = ws_sender.send(message).await {
-                if !quiet {
-                    eprintln!("Failed to send WebSocket message: {:?}", e);
-                }
-                break;
-            }
-        }
-    });
-
-    tokio::select! {
-        _ = write_handle => (),
-        _ = read_handle => (),
     }
 }
