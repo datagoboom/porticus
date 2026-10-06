@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'preact/hooks'
 import type { FleetNode, Info } from './types'
 import { SingleConsole } from './console/SingleConsole'
-import { FleetConsole } from './console/FleetConsole'
+import { ChatConsole } from './console/ChatConsole'
 
 type Mode =
   | { kind: 'loading' }
@@ -44,6 +44,6 @@ export function App() {
   }, [])
 
   if (mode.kind === 'loading') return <div class="booting">connecting…</div>
-  if (mode.kind === 'fleet') return <FleetConsole initial={mode.nodes} />
+  if (mode.kind === 'fleet') return <ChatConsole initial={mode.nodes} />
   return <SingleConsole info={mode.info} />
 }

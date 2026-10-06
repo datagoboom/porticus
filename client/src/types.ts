@@ -27,11 +27,31 @@ export interface FleetDevice {
   alias: string
   baud: number
   framing: string
+  /** User-assigned nickname (hub-stored); null/absent = use the alias. */
+  nick?: string | null
+  /** User-assigned color (hub-stored); null/absent = a default is derived. */
+  color?: string | null
 }
 
 export interface FleetNode {
   node: string
   devices: FleetDevice[]
+}
+
+/** One line in the merged multi-device chat feed. `key` is the device it belongs
+ *  to (node/alias). */
+export interface ChatEntry {
+  id: number
+  ts: number
+  key: string
+  dir: Direction
+  bytes: Uint8Array
+  text?: string
+}
+
+/** Stable identity for a device across the UI: "<node>/<alias>". */
+export function deviceKey(node: string, alias: string): string {
+  return `${node}/${alias}`
 }
 
 export type ViewMode = 'ascii' | 'hex'
