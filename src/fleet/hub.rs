@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use rustls::ServerConfig;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc};
@@ -35,14 +35,44 @@ pub struct Node {
     to_agent: mpsc::Sender<Message>,
 }
 
+/// User-assigned, hub-persisted device identity (keyed by "node/alias").
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct DeviceMeta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nick: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    color: Option<String>,
+}
+
 #[derive(Clone, Default)]
 pub struct Hub {
     nodes: Arc<Mutex<HashMap<String, Arc<Node>>>>,
+    meta: Arc<Mutex<HashMap<String, DeviceMeta>>>,
 }
 
 impl Hub {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Load persisted device nicknames/colors from the hub dir.
+    pub fn load_meta(&self) {
+        if let Ok(dir) = tls::hub_dir() {
+            if let Ok(text) = std::fs::read_to_string(dir.join("devices.json")) {
+                if let Ok(map) = serde_json::from_str::<HashMap<String, DeviceMeta>>(&text) {
+                    *self.meta.lock().unwrap() = map;
+                }
+            }
+        }
+    }
+
+    fn save_meta(&self) {
+        let Ok(dir) = tls::hub_dir() else { return };
+        let _ = std::fs::create_dir_all(&dir);
+        let snapshot = self.meta.lock().unwrap().clone();
+        if let Ok(text) = serde_json::to_string_pretty(&snapshot) {
+            let _ = std::fs::write(dir.join("devices.json"), text);
+        }
     }
 
     fn find(&self, node: &str, device: &str) -> Option<(Arc<Node>, usize)> {
@@ -54,23 +84,63 @@ impl Hub {
 
     fn fleet_json(&self) -> String {
         #[derive(Serialize)]
-        struct FleetView<'a> {
-            nodes: Vec<NodeView<'a>>,
+        struct FleetView {
+            nodes: Vec<NodeView>,
         }
         #[derive(Serialize)]
-        struct NodeView<'a> {
-            node: &'a str,
-            devices: &'a [DeviceInfo],
+        struct NodeView {
+            node: String,
+            devices: Vec<DeviceView>,
         }
-        let map = self.nodes.lock().unwrap();
-        let nodes: Vec<NodeView> = map
+        #[derive(Serialize)]
+        struct DeviceView {
+            alias: String,
+            baud: u32,
+            framing: String,
+            nick: Option<String>,
+            color: Option<String>,
+        }
+        let nodes_map = self.nodes.lock().unwrap();
+        let meta = self.meta.lock().unwrap();
+        let nodes: Vec<NodeView> = nodes_map
             .values()
             .map(|n| NodeView {
-                node: &n.name,
-                devices: &n.devices,
+                node: n.name.clone(),
+                devices: n
+                    .devices
+                    .iter()
+                    .map(|d| {
+                        let m = meta.get(&format!("{}/{}", n.name, d.alias));
+                        DeviceView {
+                            alias: d.alias.clone(),
+                            baud: d.baud,
+                            framing: d.framing.clone(),
+                            nick: m.and_then(|m| m.nick.clone()),
+                            color: m.and_then(|m| m.color.clone()),
+                        }
+                    })
+                    .collect(),
             })
             .collect();
         serde_json::to_string(&FleetView { nodes }).unwrap_or_else(|_| "{\"nodes\":[]}".into())
+    }
+
+    /// Apply a nickname/color update from POST /meta and persist it. Empty
+    /// strings clear the field; a device with neither is dropped from the store.
+    fn set_meta(&self, node: &str, alias: &str, nick: Option<String>, color: Option<String>) {
+        let key = format!("{node}/{alias}");
+        let clean = |s: Option<String>| s.filter(|v| !v.trim().is_empty());
+        {
+            let mut map = self.meta.lock().unwrap();
+            let nick = clean(nick);
+            let color = clean(color);
+            if nick.is_none() && color.is_none() {
+                map.remove(&key);
+            } else {
+                map.insert(key, DeviceMeta { nick, color });
+            }
+        }
+        self.save_meta();
     }
 
     // ----- agent side -----
@@ -232,15 +302,78 @@ impl Hub {
         let mut head = [0u8; 1024];
         let n = stream.peek(&mut head).await?;
         let text = String::from_utf8_lossy(&head[..n]);
-        let path = text.split_whitespace().nth(1).unwrap_or("/").to_string();
+        let mut tokens = text.split_whitespace();
+        let method = tokens.next().unwrap_or("GET").to_ascii_uppercase();
+        let path = tokens.next().unwrap_or("/").to_string();
         let is_ws = text.to_ascii_lowercase().contains("upgrade: websocket");
 
         if is_ws {
             self.serve_device_ws(stream, path).await;
             Ok(())
+        } else if method == "POST" && path == "/meta" {
+            self.handle_meta(stream).await
         } else {
             self.serve_http(stream, &path).await
         }
+    }
+
+    /// POST /meta — set a device's nickname/color. Body is JSON
+    /// `{"node","alias","nick","color"}` (empty strings clear a field).
+    async fn handle_meta(&self, mut stream: TcpStream) -> std::io::Result<()> {
+        #[derive(Deserialize)]
+        struct MetaReq {
+            node: String,
+            alias: String,
+            #[serde(default)]
+            nick: Option<String>,
+            #[serde(default)]
+            color: Option<String>,
+        }
+
+        // Read the full request (headers + body up to Content-Length).
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 2048];
+        let mut ok = false;
+        loop {
+            let n = stream.read(&mut tmp).await?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(split) = find_headers_end(&buf) {
+                let clen = content_length(&buf[..split]).unwrap_or(0);
+                if buf.len() >= split + clen {
+                    let body = &buf[split..split + clen];
+                    if let Ok(req) = serde_json::from_slice::<MetaReq>(body) {
+                        self.set_meta(&req.node, &req.alias, req.nick, req.color);
+                        info!(node = %req.node, alias = %req.alias, "device meta updated");
+                        ok = true;
+                    }
+                    break;
+                }
+            }
+            if buf.len() > 64 * 1024 {
+                break;
+            }
+        }
+
+        let (status, body) = if ok {
+            ("200 OK", "{\"ok\":true}")
+        } else {
+            ("400 Bad Request", "{\"ok\":false}")
+        };
+        let response = format!(
+            "HTTP/1.1 {status}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {body}",
+            body.len(),
+        );
+        stream.write_all(response.as_bytes()).await?;
+        stream.flush().await?;
+        stream.shutdown().await
     }
 
     async fn serve_http(&self, mut stream: TcpStream, path: &str) -> std::io::Result<()> {
@@ -331,4 +464,20 @@ impl Hub {
         }
         to_client.abort();
     }
+}
+
+/// Index just past the `\r\n\r\n` header terminator, if present.
+fn find_headers_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
+}
+
+/// Parse the `Content-Length` value from a request's header bytes.
+fn content_length(headers: &[u8]) -> Option<usize> {
+    let text = std::str::from_utf8(headers).ok()?;
+    for line in text.lines() {
+        if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+            return v.trim().parse().ok();
+        }
+    }
+    None
 }

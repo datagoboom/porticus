@@ -242,6 +242,7 @@ async fn run_hub(
     tls: bool,
 ) -> Result<(), Box<dyn Error>> {
     let hub = fleet::hub::Hub::new();
+    hub.load_meta();
 
     let tls_config = if tls {
         Some(fleet::tls::server_config()?)
