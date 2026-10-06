@@ -52,12 +52,17 @@ export function ChatView({ entries, label, view, showTime, wrap, paused }: Props
         aria-live="polite"
       >
         {entries.length === 0 && <div class="stream-empty">no messages yet</div>}
-        {entries.map((e) => {
+        {entries.map((e, i) => {
           const d = label(e.key)
           const body =
             e.dir === 'sys' ? e.text : view === 'hex' ? toHex(e.bytes) : toAscii(e.bytes)
+          // Collapse a run of lines from the same device + direction: show the
+          // name once, align the rest under it.
+          const prev = i > 0 ? entries[i - 1] : undefined
+          const cont = !!prev && prev.key === e.key && prev.dir === e.dir && e.dir !== 'sys'
+          const cls = `row row-${e.dir} chatrow${cont ? ' cont' : i > 0 ? ' group-start' : ''}`
           return (
-            <div key={e.id} class={`row row-${e.dir}`}>
+            <div key={e.id} class={cls}>
               {showTime && <span class="ts">{formatTime(e.ts)}</span>}
               <span class="chat-name" style={{ color: d.color }}>
                 {e.dir === 'tx' ? `you→${d.name}` : d.name}
