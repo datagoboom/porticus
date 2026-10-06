@@ -15,7 +15,19 @@ pub async fn run(
     serial_tx: mpsc::Sender<Vec<u8>>,
 ) -> Result<(), PorticusError> {
     loop {
-        let (stream, addr) = listener.accept().await?;
+        let (stream, addr) = match listener.accept().await {
+            Ok(pair) => pair,
+            // A failed accept (a connection aborted before we got it, or a
+            // transient resource shortage like EMFILE) must not kill the
+            // server. Log and keep listening; back off briefly so an
+            // immediately-recurring error (e.g. exhausted file descriptors)
+            // can't spin the loop at full tilt.
+            Err(e) => {
+                warn!("accept failed: {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         let rx = tx.subscribe();
         let serial_tx = serial_tx.clone();
         tokio::spawn(async move {
@@ -31,6 +43,11 @@ pub async fn run(
     }
 }
 
+/// Drives one connected client until it disconnects: serial bytes arriving on
+/// `rx` are sent out as binary WebSocket messages, and binary/text messages
+/// from the client are forwarded to the serial write channel. A slow client
+/// that falls behind the broadcast buffer drops messages rather than stalling
+/// the others.
 async fn handle_client<S>(
     ws: WebSocketStream<S>,
     mut rx: broadcast::Receiver<Vec<u8>>,

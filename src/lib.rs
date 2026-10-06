@@ -1,5 +1,10 @@
+pub mod capture;
 pub mod config;
 pub mod error;
+pub mod fleet;
+pub mod framing;
+pub mod http;
+pub mod script;
 pub mod serial;
 pub mod websocket;
 

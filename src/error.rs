@@ -1,5 +1,8 @@
 use thiserror::Error;
 
+/// Top-level error type for the bridge. Each variant wraps the underlying error
+/// from the relevant layer (serial, WebSocket, or raw I/O) via `#[from]`, so
+/// the `?` operator converts automatically.
 #[derive(Debug, Error)]
 pub enum PorticusError {
     #[error("Serial port error: {0}")]
