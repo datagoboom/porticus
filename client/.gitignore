@@ -1,0 +1,6 @@
+node_modules
+preview-*.png
+
+# dist/ is intentionally committed: the Rust binary embeds dist/index.html via
+# include_str!, so `cargo build` must not depend on running `npm run build`.
+# Rebuild it with `npm run build` whenever the client source changes.
